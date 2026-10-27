@@ -595,8 +595,14 @@ function logicToArea(lx, ly) {
   const ay = (ax & 1) === 0 ? Math.floor(ly / AREA) : Math.floor((ly + AREA / 2) / AREA);
   return [ax, ay];
 }
-function areaOrigin(ax, ay) { return [ax * AREA, ay * AREA - ((ax & 1) ? AREA / 2 : 0)]; }
-function areaCenter(ax, ay) { const [x, y] = areaOrigin(ax, ay); return [x + 2, y + 2]; }
+// 大格有兩種位置，跟規劃介面（index.html）一致：
+//  * 遊戲邏輯：奇數欄往上錯開半格（logicToArea、areaLogicOrigin）。主城落點、資源點、射程都照這個算
+//  * 大地圖上的畫法：整齊的方格、不錯開，大格 (ax, ay) 畫在邏輯 (6ax, 6ay) 起的方格（areaOrigin、displayArea）
+//    用實際打下的格子跟大地圖截圖比對過，不錯開的重疊度 0.81，照邏輯錯開只有 0.67
+function areaLogicOrigin(ax, ay) { return [ax * AREA, ay * AREA - ((ax & 1) ? AREA / 2 : 0)]; }
+function areaCenter(ax, ay) { const [x, y] = areaLogicOrigin(ax, ay); return [x + 2, y + 2]; }
+function areaOrigin(ax, ay) { return [ax * AREA, ay * AREA]; }
+function displayArea(lx, ly) { return [Math.floor(lx / AREA), Math.floor(ly / AREA)]; }
 function inMap(ax, ay) { return ax >= 0 && ay >= 0 && ax < S.W && ay < S.H; }
 function resAt(ax, ay) { return inMap(ax, ay) ? S.res[ay * S.W + ax] : 0; }
 function canLand(ax, ay) {
@@ -846,17 +852,20 @@ async function copyText(s, btn) {
 }
 
 // ---------------------------------------------------------------- 視角
-const ISO_K = 0.66;                    // 跟遊戲同方向：x 往右上、y 往左上，垂直方向因俯角壓扁
+// 邏輯座標往畫面的投影，跟規劃介面（index.html 的 ISO）同一組數字：x+1、y+1 各自在畫面上往哪裡走（畫面 y 往下）。
+// 照遊戲「大地圖」的視角量的：x 軸往右上約 35 度、y 軸往左上約 45 度、y 軸長度是 x 軸的 0.96 倍
+const ISO = { xx: 1.147, xy: -0.803, yx: -0.942, yy: -0.959 };
+const ISO_DET = ISO.xx * ISO.yy - ISO.yx * ISO.xy;
 function cw() { return canvas.clientWidth; }
 function ch() { return canvas.clientHeight; }
 function dpr() { return window.devicePixelRatio || 1; }
 function toScreen(lx, ly) {
   const v = S.view, dx = lx - v.cx, dy = ly - v.cy;
-  return [cw() / 2 + (dx - dy) * v.scale, ch() / 2 - (dx + dy) * v.scale * ISO_K];
+  return [cw() / 2 + (dx * ISO.xx + dy * ISO.yx) * v.scale, ch() / 2 + (dx * ISO.xy + dy * ISO.yy) * v.scale];
 }
 function screenDeltaToLogic(dxs, dys) {
-  const s = S.view.scale, a = dxs / s, b = -dys / (s * ISO_K);
-  return [(a + b) / 2, (b - a) / 2];
+  const s = S.view.scale, a = dxs / s, b = dys / s;
+  return [(ISO.yy * a - ISO.yx * b) / ISO_DET, (-ISO.xy * a + ISO.xx * b) / ISO_DET];
 }
 function toLogic(sx, sy) {
   const [dx, dy] = screenDeltaToLogic(sx - cw() / 2, sy - ch() / 2);
@@ -864,8 +873,8 @@ function toLogic(sx, sy) {
 }
 function applyIso() {
   const v = S.view, s = v.scale, r = dpr();
-  const ex = cw() / 2 - (v.cx - v.cy) * s, ey = ch() / 2 + (v.cx + v.cy) * s * ISO_K;
-  ctx.setTransform(r * s, -r * s * ISO_K, -r * s, -r * s * ISO_K, r * ex, r * ey);
+  const ex = cw() / 2 - (v.cx * ISO.xx + v.cy * ISO.yx) * s, ey = ch() / 2 - (v.cx * ISO.xy + v.cy * ISO.yy) * s;
+  ctx.setTransform(r * s * ISO.xx, r * s * ISO.xy, r * s * ISO.yx, r * s * ISO.yy, r * ex, r * ey);
 }
 function resetT() { const r = dpr(); ctx.setTransform(r, 0, 0, r, 0, 0); }
 function centerOn(lx, ly, scale) {
@@ -882,14 +891,16 @@ function zoomAt(sx, sy, factor) {
 }
 function fitPoints(pts, pad) {
   let u0 = Infinity, u1 = -Infinity, w0 = Infinity, w1 = -Infinity;
-  for (const [x, y] of pts) {
-    u0 = Math.min(u0, x - y); u1 = Math.max(u1, x - y);
-    w0 = Math.min(w0, x + y); w1 = Math.max(w1, x + y);
+  for (const [x, y] of pts) {            // 在畫面座標系裡框（scale = 1 時的畫面座標）
+    const u = x * ISO.xx + y * ISO.yx, w = x * ISO.xy + y * ISO.yy;
+    u0 = Math.min(u0, u); u1 = Math.max(u1, u);
+    w0 = Math.min(w0, w); w1 = Math.max(w1, w);
   }
   u0 -= pad; u1 += pad; w0 -= pad; w1 += pad;
   const uc = (u0 + u1) / 2, wc = (w0 + w1) / 2;
-  S.view.cx = (uc + wc) / 2; S.view.cy = (wc - uc) / 2;
-  S.view.scale = Math.max(0.12, Math.min(40, 0.95 * Math.min(cw() / (u1 - u0), ch() / ((w1 - w0) * ISO_K))));
+  S.view.cx = (ISO.yy * uc - ISO.yx * wc) / ISO_DET;
+  S.view.cy = (-ISO.xy * uc + ISO.xx * wc) / ISO_DET;
+  S.view.scale = Math.max(0.12, Math.min(40, 0.95 * Math.min(cw() / (u1 - u0), ch() / (w1 - w0))));
   draw();
 }
 function circleBox(c) { return [[c[0] - S.R, c[1] - S.R], [c[0] + S.R, c[1] + S.R], [c[0] - S.R, c[1] + S.R], [c[0] + S.R, c[1] - S.R]]; }
@@ -925,7 +936,7 @@ function buildOverview() {
       if (!id) continue;
       const cfg = S.grid[id];
       const col = rgb[Math.max(0, Math.min(8, (cfg ? cfg[0] : 1) - 1))];
-      const y0 = ay * 2 + 1 - (ax & 1);
+      const y0 = ay * 2 + 1;                         // 跟大地圖一樣不錯開
       for (let dy = 0; dy < 2; dy++) {
         const i = ((y0 + dy) * c.width + ax) * 4;
         img.data[i] = col[0]; img.data[i + 1] = col[1]; img.data[i + 2] = col[2]; img.data[i + 3] = 255;
@@ -1002,7 +1013,9 @@ function draw() {
         }
         const cfg = S.grid[id];
         const lv = cfg ? cfg[0] : 1;
-        const inside = !focus || gd(focus, [x0 + 2.5, y0 + 2.5]) <= S.R;
+        // 格子照大地圖畫在方格上，但打不打得到要看它在遊戲邏輯裡的位置（資源點在邏輯大格中央）
+        const lc = areaCenter(ax, ay);
+        const inside = !focus || gd(focus, [lc[0] + 0.5, lc[1] + 0.5]) <= S.R;
         ctx.globalAlpha = inside ? (focus ? 1 : 0.85) : 0.3;
         ctx.fillStyle = lvColor(lv);
         ctx.fillRect(x0 + g, y0 + g, AREA - 2 * g, AREA - 2 * g);
@@ -1063,7 +1076,7 @@ function draw() {
   // ---- 滑鼠所在的大格與那一格
   const hc = hoverCell();
   if (hc && sc >= 1.5) {
-    const [ax, ay] = logicToArea(hc[0], hc[1]);
+    const [ax, ay] = displayArea(hc[0], hc[1]);
     const [x0, y0] = areaOrigin(ax, ay);
     applyIso(); ctx.beginPath(); ctx.rect(x0, y0, AREA, AREA); resetT();
     ctx.strokeStyle = hexA(CSSV.ink.startsWith('#') ? CSSV.ink : '#26231f', 0.55); ctx.lineWidth = 1; ctx.setLineDash([]); ctx.stroke();
@@ -1221,10 +1234,14 @@ function showTip(sx, sy) {
   const tip = $('tip');
   const [lx, ly] = hoverCell();
   const a = areaInfo([lx, ly]);
+  // 地塊資訊對應游標底下畫出來的那個方格（同規劃介面）；能不能落城照遊戲邏輯算（a.land）
+  const [dax, day] = displayArea(lx, ly);
+  const did = resAt(dax, day);
+  const dcfg = did ? S.grid[did] : null;
   const lines = [`<b>${lx}, ${ly}</b>`];
   if (S.tool === 'target')
     lines.push(S.hoverHit >= 0 ? `<span class="act rm">${esc(t('tipRemove', { i: S.hoverHit + 1 }))}</span>` : `<span class="act">${esc(t('tipAdd'))}</span>`);
-  lines.push(a.cfg ? esc(`Lv${a.cfg[0]} ${t('res')[a.cfg[1]] || ''}`) : `<span class="m">${esc(t('emptyTip'))}</span>`);
+  lines.push(dcfg ? esc(`Lv${dcfg[0]} ${t('res')[dcfg[1]] || ''}`) : `<span class="m">${esc(t('emptyTip'))}</span>`);
   const lm = S.landmarks.find(l => Math.abs(l[0] - lx) <= 2 && Math.abs(l[1] - ly) <= 2);
   if (lm) lines.push(esc(lm[4] ? t('wharf') : (lm[5] ? t('born') : t('landmark', { lv: lm[3] || '?' }))));
   if (S.tool === 'spot') {
